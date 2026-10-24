@@ -1,5 +1,5 @@
 {
-  "name": "@mclist/mineflayer",
+  "name": "mineflayer",
   "version": "4.39.0-mclist.1",
   "description": "create minecraft bots with a stable, high level API",
   "main": "index.js",
@@ -51,8 +51,5 @@
     "standard": "^17.0.0",
     "standard-markdown": "^7.1.0",
     "typescript": "^5.4.5"
-  },
-  "publishConfig": {
-    "access": "public"
   }
 }
