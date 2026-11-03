@@ -10,6 +10,9 @@ const { once, onceWithCleanup } = require('../lib/promise_utils')
 const { EventEmitter } = require('events')
 const { getPort } = require('./common/util')
 
+// 26.3+ answers a teleport with the position in teleport_confirm alone, older versions add a position_look
+const teleportReplyPacket = (bot) => (bot.registry.version['>=']('26.3') ? 'teleport_confirm' : 'position_look')
+
 for (const supportedVersion of mineflayer.testedVersions) {
   const registry = require('prismarine-registry')(supportedVersion)
   const version = registry.version
@@ -461,7 +464,12 @@ for (const supportedVersion of mineflayer.testedVersions) {
           done()
         })
       })
-      it('answers only the latest teleport when a second one lands inside the respawn reply delay', (done) => {
+      it('answers only the latest teleport when a second one lands inside the respawn reply delay', function (done) {
+        // 26.3+ confirms right away, the position travels in teleport_confirm and nothing is delayed
+        if (bot.registry.version['>=']('26.3')) {
+          this.skip()
+          return
+        }
         // After a death the reply to the next teleport waits 1.5 s. A teleport that arrives inside
         // that window replaces it: the deferred reply must not go out with the older coordinates.
         const teleport = (teleportId, x, y, z) => ({
@@ -609,8 +617,8 @@ for (const supportedVersion of mineflayer.testedVersions) {
       it('cancels the delayed respawn teleport reply when a transfer lands inside its delay', function (done) {
         // After a death the reply to the respawn teleport is deferred 1.5 s. A proxy transfer that
         // starts inside that window must not make the timer write a play packet in the
-        // configuration state.
-        if (!bot.supportFeature('hasConfigurationState')) {
+        // configuration state. 26.3+ confirms right away, there is no delayed reply.
+        if (!bot.supportFeature('hasConfigurationState') || bot.registry.version['>=']('26.3')) {
           this.skip()
           return
         }
@@ -2384,6 +2392,60 @@ for (const supportedVersion of mineflayer.testedVersions) {
     })
 
     describe('teleports', () => {
+      it('sends at most one movement packet with a position between two tick_end packets (26.3+)', function (done) {
+        // The 26.3 server kicks with invalid_player_movement for a second position in one client tick. After a
+        // teleport into the air the bot falls right away, so a position_look next to the confirm broke this.
+        if (!bot.registry.version['>=']('26.3')) {
+          this.skip()
+          return
+        }
+        server.on('playerJoin', async (client) => {
+          try {
+            client.write('login', bot.test.generateLoginPacket())
+            const chunk = bot.test.buildChunk()
+            chunk.setBlockType(vec3(1, 65, 1), registry.blocksByName.stone.id)
+            client.write('map_chunk', generateChunkPacket(chunk))
+            await once(bot, 'chunkColumnLoad')
+            const teleport = {
+              x: 1.5,
+              y: 80,
+              z: 1.5,
+              dx: 0,
+              dy: 0,
+              dz: 0,
+              pitch: 0,
+              yaw: 0,
+              flags: { x: false, y: false, z: false, yaw: false, pitch: false },
+              teleportId: 0
+            }
+            let positionsThisTick = 0
+            let mostPositionsInATick = 0
+            const confirms = []
+            client.on('packet', (data, meta) => {
+              if (meta.name === 'position' || meta.name === 'position_look') {
+                positionsThisTick++
+                mostPositionsInATick = Math.max(mostPositionsInATick, positionsThisTick)
+              } else if (meta.name === 'tick_end') {
+                positionsThisTick = 0
+              } else if (meta.name === 'teleport_confirm') {
+                confirms.push([data.teleportId, data.x, data.y, data.z])
+              }
+            })
+            client.write('position', teleport)
+            await once(bot, 'forcedMove')
+            client.write('position', { ...teleport, y: 90, teleportId: 1 })
+            await once(bot, 'forcedMove')
+            await sleep(500)
+            assert.deepStrictEqual(confirms, [[0, 1.5, 80, 1.5], [1, 1.5, 90, 1.5]], 'the confirms carry the teleport positions')
+            assert.ok(bot.entity.position.y < 90, 'the bot falls after the teleport')
+            assert.strictEqual(mostPositionsInATick, 1, `${mostPositionsInATick} position packets in one tick`)
+            done()
+          } catch (err) {
+            done(err)
+          }
+        })
+      })
+
       it('answers a teleport at the next tick instead of from inside the packet handler', (done) => {
         server.on('playerJoin', async (client) => {
           try {
@@ -2416,7 +2478,7 @@ for (const supportedVersion of mineflayer.testedVersions) {
               bot._client.emit('position', { ...teleport, y: 90, teleportId: 1 })
               assert.deepStrictEqual(writes, [], 'the teleport must not be answered from inside the packet handler')
               await once(bot, 'forcedMove')
-              assert.ok(writes.includes('position_look'), 'the teleport is answered on the next tick')
+              assert.ok(writes.includes(teleportReplyPacket(bot)), 'the teleport is answered on the next tick')
             } finally {
               bot._client.write = write
             }
@@ -2469,7 +2531,8 @@ for (const supportedVersion of mineflayer.testedVersions) {
               const replies = writes
                 .filter(w => ['pong', 'teleport_confirm', 'position_look'].includes(w.name))
                 .map(w => (w.name === 'pong' ? `pong ${w.params.id}` : w.name))
-              assert.deepStrictEqual(replies, ['pong 1', 'teleport_confirm', 'position_look', 'pong 2'])
+              const teleportReplies = teleportReplyPacket(bot) === 'position_look' ? ['teleport_confirm', 'position_look'] : ['teleport_confirm']
+              assert.deepStrictEqual(replies, ['pong 1', ...teleportReplies, 'pong 2'])
             } finally {
               bot._client.write = write
             }
@@ -2506,7 +2569,7 @@ for (const supportedVersion of mineflayer.testedVersions) {
             const replies = []
             const write = bot._client.write.bind(bot._client)
             bot._client.write = (name, params) => {
-              if (name === 'position_look') replies.push(params.y)
+              if (name === teleportReplyPacket(bot)) replies.push(params.y)
               return write(name, params)
             }
             try {
@@ -2552,7 +2615,7 @@ for (const supportedVersion of mineflayer.testedVersions) {
             const replies = []
             const write = bot._client.write.bind(bot._client)
             bot._client.write = (name, params) => {
-              if (name === 'position_look') replies.push(params.yaw)
+              if (name === teleportReplyPacket(bot)) replies.push(params.yaw ?? params.yRot)
               return write(name, params)
             }
             try {
